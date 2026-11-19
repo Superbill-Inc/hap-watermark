@@ -45,7 +45,7 @@ _POLYS = (0o171, 0o133)
 @dataclass
 class DsssOptions:
     payload_bits: int = 64  # multiple of 8, up to 256 (e.g. 128); longer payload = longer frame
-    level_dbfs: float = -47.0  # bed level while the bot is silent
+    level_dbfs: float = -57.0  # bed level while the bot is silent (-47 is louder/more robust; below ~-62 decoding in silence degrades)
     speech_margin_db: float | None = None  # raise the bed under speech to (speech - N dB); None = constant
     chips_per_symbol: int = 120  # spreading per coded bit (frame = sync + 2 x (payload_bits + 22) x this chips)
     sync_chips: int = 2048

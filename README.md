@@ -118,7 +118,7 @@ After the call, the summary measures the real TX→RX channel delay by cross-cor
 
 ## Bed watermark: 64-bit payload with built-in sync (no per-provider offsets)
 
-`watermark/impls/dsss.py` carries a 64-bit payload in a designed room-tone "bed": spread-spectrum noise shaped like room tone (a reference recording's spectrum via `DSSS_BED_PATH`, else a generic shape), at −47 dBFS. It doesn't depend on the bot speaking, and it needs no GPU.
+`watermark/impls/dsss.py` carries a 64-bit payload in a designed room-tone "bed": spread-spectrum noise shaped like room tone (a reference recording's spectrum via `DSSS_BED_PATH`, else a generic shape), at −57 dBFS by default (`level_dbfs`; the earlier results below were measured at −47). It doesn't depend on the bot speaking, and it needs no GPU.
 - **Frame (repeats):** a 0.26 s sync sequence, then 172 coded symbols. The payload gets CRC-16 and a rate-½ K=7 convolutional code, plus an interleaver. A frame lasts 2.84 s.
 - **Decoder:** inverse shaping filter, then 10 ms loudness normalization, then a sync search (exact sample position, either polarity). Symbols are despread while timing is tracked in ±1-packet steps (jitter buffer) and ±1-sample steps (clock drift). Then soft Viterbi and the CRC check. A "flywheel" combines repeated frames when one fails.
 - **Optional:** `speech_margin_db` raises the bed under the bot's speech (speech masks it).
