@@ -74,6 +74,7 @@ class WatermarkCall(TelnyxCall):
         else:
             self.speech = np.zeros(n, np.float32)
         self.tx_pos = 0
+        self.src_log: list[np.ndarray] = []  # clean bot voice before watermarking (for --save)
         self.wm_gain = 1.0  # current watermark mix (ramped on toggles)
         self.wm_state: bool | None = None
         self.mic_q: queue.Queue = queue.Queue()
@@ -97,7 +98,10 @@ class WatermarkCall(TelnyxCall):
                 sp = self.next_mic_packet() if self.args.mic else self.speech[self.tx_pos:self.tx_pos + PACKET]
                 if len(sp) < PACKET:
                     sp = np.pad(sp, (0, PACKET - len(sp)))
-                x = self.mix(sp.astype(np.float32))
+                sp = sp.astype(np.float32)
+                if self.args.save:
+                    self.src_log.append(sp)
+                x = self.mix(sp)
                 self.tx_q.put(pcmu_encode(np.clip(x, -1, 1)).tobytes())
                 self.tx_pos += PACKET
             time.sleep(0.005)
@@ -238,10 +242,13 @@ class WatermarkCall(TelnyxCall):
         if self.args.save and self.sent_log:
             out = Path(self.args.save)
             out.mkdir(parents=True, exist_ok=True)
+            if self.src_log:  # what the bot "said", before the watermark
+                sf.write(str(out / "source_8k.wav"), np.concatenate(self.src_log)[: len(self.sent_log) * PACKET], FS)
             sf.write(str(out / "tx_sent_8k.wav"), pcmu_decode(np.frombuffer(b"".join(self.sent_log), np.uint8)), FS)
             if self.rx_log:
                 sf.write(str(out / "rx_received_8k.wav"), pcmu_decode(np.frombuffer(b"".join(self.rx_log), np.uint8)), FS)
-            print(f"Saved sent/received audio to {out}/")
+            print(f"Saved to {out}/: source_8k.wav (clean input), tx_sent_8k.wav (watermarked, as sent), "
+                  f"rx_received_8k.wav (as received)")
 
 
 def scheme_options(args: argparse.Namespace) -> dict[str, str]:

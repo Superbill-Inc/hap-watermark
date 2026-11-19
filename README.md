@@ -14,7 +14,7 @@ Pluggable audio watermarking for phone calls. There are two schemes behind one S
 | `watermark/impls/` | **Implementations,** one module per scheme. `watermark/impls/<name>.py` defines `<Name>Scheme` (registered as `"<name>"`) and `<Name>Options`. The embedder and detector classes are private. |
 
 Built-in schemes:
-- **`dsss`** (`watermark/impls/dsss.py`): a 64-bit payload in a spread-spectrum room-tone bed, with the modem included. It finds sync by itself and verifies with CRC-16 (`verified=True`). Runs at 8 kHz.
+- **`dsss`** (`watermark/impls/dsss.py`): a 64-bit payload by default (`--opt payload_bits=128` for 128 bits; any multiple of 8 up to 256) in a spread-spectrum room-tone bed, with the modem included. It finds sync by itself and verifies with CRC-16 (`verified=True`). Runs at 8 kHz.
 - **`audioseal`** (`watermark/impls/audioseal.py`): a 16-bit payload carried by the speech itself (base AudioSeal model, streamed block by block). The detector needs the 320-sample grid (`grid_offset`, 86 on the Telnyx route). There's no checksum, so it reports after `confirm` agreeing windows (`verified=False`). Runs at 16 kHz.
 
 To add a scheme, put `MyScheme(BaseScheme)` in `watermark/impls/mine.py` and add `"mine": "watermark.impls.mine:MyScheme"` to `BUILTIN_IMPLS` in `watermark/factory/builtins.py`. Alternatively call `watermark.default_factory.register("mine", MyScheme)` at runtime. Both testbeds then accept `--scheme mine`. Schemes are imported only when used, so `dsss` never loads torch.
@@ -122,6 +122,8 @@ After the call, the summary measures the real TX→RX channel delay by cross-cor
 - **Frame (repeats):** a 0.26 s sync sequence, then 172 coded symbols. The payload gets CRC-16 and a rate-½ K=7 convolutional code, plus an interleaver. A frame lasts 2.84 s.
 - **Decoder:** inverse shaping filter, then 10 ms loudness normalization, then a sync search (exact sample position, either polarity). Symbols are despread while timing is tracked in ±1-packet steps (jitter buffer) and ±1-sample steps (clock drift). Then soft Viterbi and the CRC check. A "flywheel" combines repeated frames when one fails.
 - **Optional:** `speech_margin_db` raises the bed under the bot's speech (speech masks it).
+- **Gap between frames:** `gap_s` (default 0) adds a data-free pause after every frame. By default the pause is filled with the same shaped noise, so the bed sounds continuous; `gap_fill=silence` makes it silent. It lets a detector that finishes or restarts at the end of a frame still catch the next sync. With `gap_s=1`, back-to-back detections come every 3.8 s instead of every 5.7 s (64-bit).
+- **Payload size:** `payload_bits` (default 64). A 128-bit frame has 300 coded symbols instead of 172 and lasts 4.76 s instead of 2.84 s. In the local test (10 trials per scenario, 10 s window, speech boost at 20 dB), 128 bits was as reliable as 64 bits, with a median first decode of about 5.0 s instead of 3.0 s. `chips_per_symbol=80` brings the frame down to 3.26 s (about 3.4 s to decode) but is less robust under bot speech.
 
 **Local round trip (simulated channel):**
 

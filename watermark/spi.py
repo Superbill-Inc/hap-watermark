@@ -62,7 +62,7 @@ class Scheme(ABC):
 
     name: ClassVar[str]
     Options: ClassVar[type] = NoOptions  # dataclass of tunables; every field must have a default
-    payload_bits: ClassVar[int]  # multiple of 8
+    payload_bits: int  # multiple of 8; fixed per instance (may depend on options, e.g. dsss)
     sample_rate: ClassVar[int]  # native rate of embedder and detector
     # Embedder output is structured in frames of this many native samples, and the detector
     # needs the received stream on the same grid (e.g. AudioSeal = 320). Rate adapters keep

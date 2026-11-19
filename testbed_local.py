@@ -26,22 +26,59 @@ FS = 8000
 PACKET = 160
 
 
+def _phrases(speech: np.ndarray) -> list[np.ndarray]:
+    """Split speech into phrases at its natural pauses (>= 120 ms more than 40 dB below the peak)."""
+    frames = speech[: len(speech) // 160 * 160].reshape(-1, 160)
+    rms = np.sqrt((frames**2).mean(axis=1))
+    quiet = rms < rms.max() * 10 ** (-40 / 20)
+    cuts, run = [0], 0
+    for i, q in enumerate(quiet):
+        run = run + 1 if q else 0
+        if run == 6:  # 120 ms of pause: cut in the middle of it
+            cuts.append((i - 3) * 160)
+    cuts.append(len(speech))
+    out = []
+    for a, b in zip(cuts, cuts[1:]):
+        seg = speech[a:b]
+        loud = np.nonzero(np.abs(seg) > np.abs(speech).max() * 10 ** (-40 / 20))[0]
+        if len(loud):
+            out.append(seg[loud[0]:loud[-1] + 1])
+    return out or [speech]
+
+
+def _faded(x: np.ndarray, ms: float = 5.0) -> np.ndarray:
+    n = min(int(FS * ms / 1000), len(x) // 2)
+    if n:
+        x = x.copy()
+        ramp = np.linspace(0, 1, n, dtype=np.float32)
+        x[:n] *= ramp
+        x[-n:] *= ramp[::-1]
+    return x
+
+
 def speech_track(n: int, duty: float, rng: np.random.Generator, speech: np.ndarray) -> np.ndarray:
-    """Bot speech as talk spurts (1-3 s) covering `duty` of the time."""
+    """Bot speech covering about `duty` of the time: talk spurts of whole phrases (1-3 s), cut at the
+    sample's natural pauses with short fades, separated by silence. duty >= 1: phrases back to back."""
     out = np.zeros(n, np.float32)
     if duty <= 0:
         return out
-    if duty >= 1:
-        reps = int(np.ceil(n / len(speech))) + 1
-        s0 = int(rng.integers(0, len(speech)))
-        return np.tile(speech, reps)[s0:s0 + n]
-    t = int(rng.uniform(0, 1.5) * FS)
+    phrases = _phrases(speech)
+    k = int(rng.integers(0, len(phrases)))  # start at a random phrase
+
+    def next_spurt(min_s: float) -> np.ndarray:
+        nonlocal k
+        parts = []
+        while sum(len(p) for p in parts) < min_s * FS:
+            parts += [_faded(phrases[k % len(phrases)]), np.zeros(int(0.15 * FS), np.float32)]
+            k += 1
+        return np.concatenate(parts[:-1])
+
+    t = 0 if duty >= 1 else int(rng.uniform(0, 1.5) * FS)
     while t < n:
-        L = int(rng.uniform(1, 3) * FS)
-        s0 = int(rng.integers(0, max(1, len(speech) - L)))
-        seg = speech[s0:s0 + L]
+        seg = next_spurt(rng.uniform(1, 3))
         out[t:t + len(seg)] = seg[: max(0, min(len(seg), n - t))]
-        t += L + int(L * (1 - duty) / duty * rng.uniform(0.5, 1.5))
+        gap = 0.15 if duty >= 1 else len(seg) / FS * (1 - duty) / duty * rng.uniform(0.5, 1.5)
+        t += len(seg) + int(gap * FS)
     return out
 
 

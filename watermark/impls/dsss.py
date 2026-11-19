@@ -4,11 +4,14 @@ The bed is +-1 pseudo-random chips at 8000 chips/s, filtered to a room-tone spec
 reference recording (option bed_path, default $DSSS_BED_PATH), else a generic room-tone shape. The embedder adds it to the outgoing audio (the
 bot's voice, or zeros), so the payload doesn't depend on the bot speaking.
 
-Frame (repeats for as long as the bed plays):
-    [ SYNC: sync_chips of known PN ] [ DATA: 172 coded symbols x chips_per_symbol, each = +-data PN ]
+Frame (repeats for as long as the bed plays, optionally followed by a gap of gap_s seconds):
+    [ SYNC: sync_chips of known PN ] [ DATA: coded symbols x chips_per_symbol, each = +-data PN ] [ GAP ]
+The gap carries no data (shaped filler noise, so the bed sounds continuous, or silence). It
+lets a detector that finishes, or restarts at, the end of one frame catch the next frame's sync.
 
-Payload: 64 bits + CRC-16/CCITT -> rate-1/2 K=7 convolutional code (171,133 octal; 6 tail bits)
--> fixed pseudo-random interleaver -> BPSK symbols.
+Payload: `payload_bits` (64 by default, 128 supported; any multiple of 8 up to 256) + CRC-16/CCITT
+-> rate-1/2 K=7 convolutional code (171,133 octal; 6 tail bits) -> fixed pseudo-random interleaver
+-> BPSK symbols: 2 x (payload_bits + 22) per frame (172 for 64 bits, 300 for 128).
 
 Detector (streaming):
   1. equalize the bed shaping (inverse filter, 300-3400 Hz), normalize loudness per 10 ms
@@ -21,6 +24,7 @@ Detector (streaming):
 
 from __future__ import annotations
 
+import functools
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,7 +36,7 @@ from ..spi import Detection, Detector, Embedder
 
 _FS = 8000
 _PACKET = 160  # 20 ms
-_PAYLOAD_BITS = 64
+_MAX_PAYLOAD_BITS = 256
 _CRC_BITS = 16
 _K = 7  # convolutional code constraint length
 _POLYS = (0o171, 0o133)
@@ -40,19 +44,30 @@ _POLYS = (0o171, 0o133)
 
 @dataclass
 class DsssOptions:
+    payload_bits: int = 64  # multiple of 8, up to 256 (e.g. 128); longer payload = longer frame
     level_dbfs: float = -47.0  # bed level while the bot is silent
     speech_margin_db: float | None = None  # raise the bed under speech to (speech - N dB); None = constant
-    chips_per_symbol: int = 120  # spreading per coded bit (frame = sync + 172 x this chips)
+    chips_per_symbol: int = 120  # spreading per coded bit (frame = sync + 2 x (payload_bits + 22) x this chips)
     sync_chips: int = 2048
     # recording whose spectrum the bed imitates (sender and receiver must agree); None = generic room tone
     bed_path: Path | None = field(default_factory=lambda: os.environ.get("DSSS_BED_PATH") or None)
+    gap_s: float = 0.0  # pause after each frame; 0 = frames back to back
+    gap_fill: str = "noise"  # "noise" = data-free bed (sounds continuous) or "silence"
 
 
 class DsssScheme(BaseScheme):
     name = "dsss"
     Options = DsssOptions
-    payload_bits = _PAYLOAD_BITS
     sample_rate = _FS
+
+    def __init__(self, options=None):
+        super().__init__(options)
+        bits = self.options.payload_bits
+        if bits % 8 or not 8 <= bits <= _MAX_PAYLOAD_BITS:
+            raise ValueError(f"dsss payload_bits must be a multiple of 8 in 8..{_MAX_PAYLOAD_BITS}, got {bits}")
+        self.payload_bits = bits
+        if self.options.gap_s < 0 or self.options.gap_fill not in ("noise", "silence"):
+            raise ValueError("dsss gap_s must be >= 0 and gap_fill 'noise' or 'silence'")
 
     def embedder(self, payload: bytes) -> Embedder:
         return _DsssEmbedder(_to_bits(self.check_payload(payload)), self.options)
@@ -61,7 +76,9 @@ class DsssScheme(BaseScheme):
         return _DsssDetector(self.options)
 
     def describe(self) -> str:
-        return super().describe() + f"; frame {_frame_chips(self.options) / _FS:.2f}s"
+        gap = _gap_chips(self.options)
+        return super().describe() + f"; frame {_frame_chips(self.options) / _FS:.2f}s" + (
+            f" + gap {gap / _FS:.2f}s ({self.options.gap_fill})" if gap else "")
 
 
 # --- payload coding ------------------------------------------------------------------------
@@ -139,23 +156,36 @@ def _viterbi(soft: np.ndarray) -> np.ndarray:
     return bits[: T - (_K - 1)]
 
 
-_N_CODED = 2 * (_PAYLOAD_BITS + _CRC_BITS + _K - 1)  # 172
-_PERM = np.random.default_rng(0xBED).permutation(_N_CODED)
+def _n_coded(payload_bits: int) -> int:
+    """Code symbols per frame: (payload + CRC + tail) bits at rate 1/2 (172 for 64 bits)."""
+    return 2 * (payload_bits + _CRC_BITS + _K - 1)
 
 
-def _encode_payload(payload_bits: np.ndarray) -> np.ndarray:
-    """64 payload bits -> _N_CODED interleaved +-1 symbols."""
-    coded = _conv_encode(np.concatenate([payload_bits, _crc16(payload_bits)]))
-    return (1.0 - 2.0 * coded[_PERM]).astype(np.float32)
+class _Codec:
+    """Payload bits <-> interleaved +-1 code symbols, for one payload size."""
+
+    def __init__(self, payload_bits: int):
+        self.payload_bits = payload_bits
+        self.n_coded = _n_coded(payload_bits)
+        self._perm = np.random.default_rng(0xBED).permutation(self.n_coded)
+
+    def encode(self, payload_bits: np.ndarray) -> np.ndarray:
+        coded = _conv_encode(np.concatenate([payload_bits, _crc16(payload_bits)]))
+        return (1.0 - 2.0 * coded[self._perm]).astype(np.float32)
+
+    def decode(self, soft: np.ndarray) -> np.ndarray | None:
+        """Interleaved soft symbols -> payload bits, or None if the CRC fails."""
+        deint = np.empty_like(soft)
+        deint[self._perm] = soft
+        bits = _viterbi(deint)
+        n = self.payload_bits
+        payload, crc = bits[:n], bits[n:n + _CRC_BITS]
+        return payload if np.array_equal(_crc16(payload), crc) else None
 
 
-def _decode_symbols(soft: np.ndarray) -> np.ndarray | None:
-    """Interleaved soft symbols -> 64 payload bits, or None if the CRC fails."""
-    deint = np.empty_like(soft)
-    deint[_PERM] = soft
-    bits = _viterbi(deint)
-    payload, crc = bits[:_PAYLOAD_BITS], bits[_PAYLOAD_BITS:_PAYLOAD_BITS + _CRC_BITS]
-    return payload if np.array_equal(_crc16(payload), crc) else None
+@functools.lru_cache(maxsize=None)
+def _codec(payload_bits: int) -> _Codec:
+    return _Codec(payload_bits)
 
 
 # --- bed shaping and frame layout ------------------------------------------------------------
@@ -194,15 +224,19 @@ class _StreamFIR:
         return np.convolve(buf, self._taps, "valid").astype(np.float32)
 
 
+def _gap_chips(o: DsssOptions) -> int:
+    return int(round(o.gap_s * _FS))
+
+
 def _frame_chips(o: DsssOptions) -> int:
-    return o.sync_chips + _N_CODED * o.chips_per_symbol
+    return o.sync_chips + _n_coded(o.payload_bits) * o.chips_per_symbol
 
 
 def _codes(o: DsssOptions) -> tuple[np.ndarray, np.ndarray]:
     """(sync PN, data PN) shared by embedder and detector."""
     rng = np.random.default_rng(0x5EED)
     pm = np.array([-1.0, 1.0], np.float32)
-    return rng.choice(pm, o.sync_chips), rng.choice(pm, _N_CODED * o.chips_per_symbol)
+    return rng.choice(pm, o.sync_chips), rng.choice(pm, _n_coded(o.payload_bits) * o.chips_per_symbol)
 
 
 # --- embedder ------------------------------------------------------------------------------
@@ -211,8 +245,14 @@ class _DsssEmbedder(Embedder):
 
     def __init__(self, payload_bits: np.ndarray, o: DsssOptions):
         sync, data = _codes(o)
-        sym = _encode_payload(payload_bits)
-        self._chips = np.concatenate([sync, (data.reshape(_N_CODED, -1) * sym[:, None]).ravel()])
+        codec = _codec(o.payload_bits)
+        sym = codec.encode(payload_bits)
+        frame = [sync, (data.reshape(codec.n_coded, -1) * sym[:, None]).ravel()]
+        gap = _gap_chips(o)
+        if gap:  # filler uses its own PN, uncorrelated with sync and data codes
+            frame.append(np.random.default_rng(0x6A9).choice(np.array([-1.0, 1.0], np.float32), gap)
+                         if o.gap_fill == "noise" else np.zeros(gap, np.float32))
+        self._chips = np.concatenate(frame)
         h, _ = _shaping_filters(o.bed_path)
         self._fir = _StreamFIR(h)
         self._unit = 1.0 / float(np.sqrt(np.sum(h**2)))  # shaped chips -> unit RMS
@@ -253,15 +293,17 @@ class _DsssDetector(Detector):
 
     def __init__(self, o: DsssOptions):
         self._o = o
+        self._codec = _codec(o.payload_bits)
+        self._n = self._codec.n_coded
         self._sync, data = _codes(o)
-        self._data = data.reshape(_N_CODED, o.chips_per_symbol)
+        self._data = data.reshape(self._n, o.chips_per_symbol)
         _, g = _shaping_filters(o.bed_path)
         self._eq_fir = _StreamFIR(g)
         self._eq = np.zeros(0, np.float32)  # equalized + loudness-normalized per 10 ms block
         self._eq_tail = np.zeros(0, np.float32)
         self._search_from = 0
         self._pending_sync: tuple | None = None  # (pos, z) or ("predict", pos, z)
-        self._acc = np.zeros(_N_CODED, np.float32)
+        self._acc = np.zeros(self._n, np.float32)
         self._n_acc = 0
         self._blind = 0  # consecutive frames decoded from a prediction without a visible sync
         self._result: Detection | None = None
@@ -324,7 +366,7 @@ class _DsssDetector(Detector):
     def _despread(self, p: int) -> tuple[np.ndarray, list, int] | None:
         """Soft symbols of the frame at sync position p, or None if more audio is needed."""
         Ns, Ls = self._o.chips_per_symbol, self._o.sync_chips
-        soft, off, shifts = np.zeros(_N_CODED, np.float32), 0, []
+        soft, off, shifts = np.zeros(self._n, np.float32), 0, []
 
         def dots(k0, k1, o):
             start = p + Ls + k0 * Ns + o
@@ -340,8 +382,8 @@ class _DsssDetector(Detector):
             seg = self._eq[start:start + (k1 - k0) * Ns].reshape(k1 - k0, Ns)
             return d / (np.mean(seg**2, axis=1) + 1e-12)
 
-        for k0 in range(0, _N_CODED, self._TRACK_EVERY):
-            k1 = min(_N_CODED, k0 + self._TRACK_EVERY)
+        for k0 in range(0, self._n, self._TRACK_EVERY):
+            k1 = min(self._n, k0 + self._TRACK_EVERY)
             cur = dots(k0, k1, off)
             if cur is None:
                 return None
@@ -360,6 +402,7 @@ class _DsssDetector(Detector):
 
     def _process(self):
         frame = _frame_chips(self._o)
+        period = frame + _gap_chips(self._o)  # sync-to-sync distance
         while self._result is None:
             if self._pending_sync is None:
                 found = self._find_sync()
@@ -382,9 +425,9 @@ class _DsssDetector(Detector):
             soft = np.sign(z) * soft / (np.sqrt(np.mean(soft**2)) + 1e-12)
             self._acc += soft
             self._n_acc += 1
-            payload, used = _decode_symbols(soft), 1
+            payload, used = self._codec.decode(soft), 1
             if payload is None and self._n_acc > 1:
-                payload, used = _decode_symbols(self._acc), self._n_acc
+                payload, used = self._codec.decode(self._acc), self._n_acc
             if payload is not None:
                 self._result = Detection(
                     payload=_to_bytes(payload),
@@ -394,11 +437,11 @@ class _DsssDetector(Detector):
                     info={"sync_z": round(z, 1), "frames": used, "timing_shifts": [s for _, s in shifts]},
                 )
                 return
-            self._search_from = max(0, p + frame + off - 3 * _PACKET)
+            self._search_from = max(0, p + period + off - 3 * _PACKET)
             if self._n_acc >= 3 or self._blind >= 2:
                 # the lock is probably wrong (false sync, or timing lost): drop it and search afresh
                 self._acc[:], self._n_acc, self._blind, self._pending_sync = 0.0, 0, 0, None
                 continue
             # flywheel: the next frame starts one frame later (plus tracked shifts); confirm
             # locally if the sync is visible, otherwise trust the prediction and keep combining
-            self._pending_sync = ("predict", p + frame + off, z)
+            self._pending_sync = ("predict", p + period + off, z)
